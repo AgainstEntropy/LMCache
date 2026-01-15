@@ -1728,34 +1728,24 @@ class BufferAllocator(MemoryAllocatorInterface):
         return True
 
 
-class HostMemoryAllocator(MemoryAllocatorInterface):
-    """Allocates memory in the pre-allocated Host memory."""
+class DelegatingAllocator(MemoryAllocatorInterface):
+    """Thin wrapper that delegates to an underlying allocator under a lock.
 
-    def __init__(self, size: int, use_paging: bool = False, **kwargs):
-        """
-        :param int size: The size of the pinned memory in bytes.
-        """
-        buffer = torch.empty(size, dtype=torch.uint8, device="cpu")
+    Many allocators in this file differ only in how they *create* the backing
+    buffer and the underlying allocator, but their allocate/free methods are
+    identical. This class centralizes that delegation logic.
+    """
 
-        self.allocator: MemoryAllocatorInterface
-        if use_paging:
-            assert "shapes" in kwargs, (
-                "shapes must be specified for paged memory allocator"
-            )
-            assert "dtypes" in kwargs, (
-                "dtypes must be specified for paged memory allocator"
-            )
-            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
-            self.allocator = PagedTensorMemoryAllocator(
-                tensor=buffer,
-                shapes=kwargs["shapes"],
-                dtypes=kwargs["dtypes"],
-                fmt=kwargs["fmt"],
-            )
-        else:
-            self.allocator = TensorMemoryAllocator(buffer)
-
-        self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
+    def __init__(
+        self,
+        allocator: MemoryAllocatorInterface,
+        lock: Any,
+        *,
+        forward_update_stats: bool = False,
+    ):
+        self._delegate_allocator = allocator
+        self._delegate_lock = lock
+        self._forward_update_stats = forward_update_stats
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -1765,8 +1755,8 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[MemoryObj]:
-        with self.host_mem_lock:
-            return self.allocator.allocate(shapes, dtypes, fmt, str(self))
+        with self._delegate_lock:
+            return self._delegate_allocator.allocate(shapes, dtypes, fmt, str(self))
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
@@ -1777,15 +1767,15 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[List[MemoryObj]]:
-        with self.host_mem_lock:
-            return self.allocator.batched_allocate(
+        with self._delegate_lock:
+            return self._delegate_allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt, str(self)
             )
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
-        with self.host_mem_lock:
-            self.allocator.free(memory_obj)
+        with self._delegate_lock:
+            self._delegate_allocator.free(memory_obj)
 
     @_lmcache_nvtx_annotate
     def batched_free(
@@ -1794,18 +1784,54 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
         allocator_type: Optional[str] = None,
         update_stats: bool = True,
     ):
-        with self.host_mem_lock:
-            self.allocator.batched_free(memory_objs)
+        with self._delegate_lock:
+            if self._forward_update_stats:
+                self._delegate_allocator.batched_free(
+                    memory_objs, update_stats=update_stats
+                )
+            else:
+                # Preserve legacy wrappers' behavior: ignore update_stats.
+                self._delegate_allocator.batched_free(memory_objs)
 
     def memcheck(self):
-        with self.host_mem_lock:
-            return self.allocator.memcheck()
+        with self._delegate_lock:
+            return self._delegate_allocator.memcheck()
+
+
+class HostMemoryAllocator(DelegatingAllocator):
+    """Allocates memory in the pre-allocated Host memory."""
+
+    def __init__(self, size: int, use_paging: bool = False, **kwargs):
+        """
+        :param int size: The size of the pinned memory in bytes.
+        """
+        buffer = torch.empty(size, dtype=torch.uint8, device="cpu")
+
+        if use_paging:
+            assert "shapes" in kwargs, (
+                "shapes must be specified for paged memory allocator"
+            )
+            assert "dtypes" in kwargs, (
+                "dtypes must be specified for paged memory allocator"
+            )
+            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
+            allocator: MemoryAllocatorInterface = PagedTensorMemoryAllocator(
+                tensor=buffer,
+                shapes=kwargs["shapes"],
+                dtypes=kwargs["dtypes"],
+                fmt=kwargs["fmt"],
+            )
+        else:
+            allocator = TensorMemoryAllocator(buffer)
+
+        lock = threading.Lock() if not use_paging else nullcontext()
+        super().__init__(allocator=allocator, lock=lock, forward_update_stats=False)
 
     def __str__(self):
         return "HostMemoryAllocator"
 
 
-class PinMemoryAllocator(MemoryAllocatorInterface):
+class PinMemoryAllocator(DelegatingAllocator):
     """Allocates memory in the pre-allocated pinned memory."""
 
     def __init__(self, size: int, use_paging: bool = False, **kwargs):
@@ -1822,7 +1848,6 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
             self.buffer = torch.frombuffer(buf, dtype=torch.uint8)
         self._unregistered = False
 
-        self.allocator: MemoryAllocatorInterface
         if use_paging:
             assert "shapes" in kwargs, (
                 "shapes must be specified for paged memory allocator"
@@ -1831,60 +1856,17 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
                 "dtypes must be specified for paged memory allocator"
             )
             assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
-            self.allocator = PagedTensorMemoryAllocator(
+            allocator: MemoryAllocatorInterface = PagedTensorMemoryAllocator(
                 tensor=self.buffer,
                 shapes=kwargs["shapes"],
                 dtypes=kwargs["dtypes"],
                 fmt=kwargs["fmt"],
             )
         else:
-            self.allocator = TensorMemoryAllocator(self.buffer)
+            allocator = TensorMemoryAllocator(self.buffer)
 
-        self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
-
-    @_lmcache_nvtx_annotate
-    def allocate(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
-        allocator_type: Optional[str] = None,
-    ) -> Optional[MemoryObj]:
-        with self.host_mem_lock:
-            return self.allocator.allocate(shapes, dtypes, fmt, str(self))
-
-    @_lmcache_nvtx_annotate
-    def batched_allocate(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        batch_size: int,
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
-        allocator_type: Optional[str] = None,
-    ) -> Optional[List[MemoryObj]]:
-        with self.host_mem_lock:
-            return self.allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt, str(self)
-            )
-
-    @_lmcache_nvtx_annotate
-    def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
-        with self.host_mem_lock:
-            self.allocator.free(memory_obj)
-
-    @_lmcache_nvtx_annotate
-    def batched_free(
-        self,
-        memory_objs: List[MemoryObj],
-        allocator_type: Optional[str] = None,
-        update_stats: bool = True,
-    ):
-        with self.host_mem_lock:
-            self.allocator.batched_free(memory_objs)
-
-    def memcheck(self):
-        with self.host_mem_lock:
-            return self.allocator.memcheck()
+        lock = threading.Lock() if not use_paging else nullcontext()
+        super().__init__(allocator=allocator, lock=lock, forward_update_stats=False)
 
     def close(self):
         if not self._unregistered:
@@ -2483,7 +2465,7 @@ class ProgressivePinnedPagedMemoryAllocator(_ProgressivePinnedBase):
         return "ProgressivePinnedPagedMemoryAllocator"
 
 
-class GPUMemoryAllocator(MemoryAllocatorInterface):
+class GPUMemoryAllocator(DelegatingAllocator):
     """Allocates memory in the pre-allocated GPU memory."""
 
     def __init__(
@@ -2503,7 +2485,6 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
 
         self.tensor = torch.empty(size, dtype=torch.uint8, device=device)
 
-        self.allocator: MemoryAllocatorInterface
         if use_paging:
             assert "shapes" in kwargs, (
                 "shapes must be specified for paged memory allocator"
@@ -2512,7 +2493,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
                 "dtypes must be specified for paged memory allocator"
             )
             assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
-            self.allocator = PagedTensorMemoryAllocator(
+            allocator: MemoryAllocatorInterface = PagedTensorMemoryAllocator(
                 tensor=self.tensor,
                 shapes=kwargs["shapes"],
                 dtypes=kwargs["dtypes"],
@@ -2522,51 +2503,10 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             kwargs = {}
             if align_bytes is not None:
                 kwargs["align_bytes"] = align_bytes
-            self.allocator = TensorMemoryAllocator(self.tensor, **kwargs)
+            allocator = TensorMemoryAllocator(self.tensor, **kwargs)
 
-        self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
-
-    @_lmcache_nvtx_annotate
-    def allocate(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
-        allocator_type: Optional[str] = None,
-    ) -> Optional[MemoryObj]:
-        with self.device_mem_lock:
-            return self.allocator.allocate(shapes, dtypes, fmt, str(self))
-
-    @_lmcache_nvtx_annotate
-    def batched_allocate(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        batch_size: int,
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
-        allocator_type: Optional[str] = None,
-    ) -> Optional[List[MemoryObj]]:
-        with self.device_mem_lock:
-            return self.allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt, str(self)
-            )
-
-    def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
-        with self.device_mem_lock:
-            self.allocator.free(memory_obj)
-
-    def batched_free(
-        self,
-        memory_objs: List[MemoryObj],
-        allocator_type: Optional[str] = None,
-        update_stats: bool = True,
-    ):
-        with self.device_mem_lock:
-            self.allocator.batched_free(memory_objs)
-
-    def memcheck(self):
-        with self.device_mem_lock:
-            return self.allocator.memcheck()
+        lock = threading.Lock() if not use_paging else nullcontext()
+        super().__init__(allocator=allocator, lock=lock, forward_update_stats=False)
 
     def __str__(self):
         return "GPUMemoryAllocator"
