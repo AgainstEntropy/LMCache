@@ -11,7 +11,10 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import PinMemoryAllocator
+from lmcache.v1.memory_management import (
+    PinMemoryAllocator,
+    ProgressivePinnedMemoryAllocator,
+)
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.connector import CreateConnector
@@ -25,6 +28,39 @@ from .utils import (
 )
 
 
+# Counter for unique key generation across tests
+_test_key_counter = 0
+
+
+def _unique_cache_key():
+    """Generate a unique cache key for each test to avoid cross-test interference."""
+    global _test_key_counter
+    _test_key_counter += 1
+    return dumb_cache_engine_key(id=_test_key_counter)
+
+
+# Allocator factory functions for parameterization
+def _create_pin_allocator(size: int):
+    """Create a standard PinMemoryAllocator."""
+    return PinMemoryAllocator(size)
+
+
+def _create_progressive_allocator(size: int):
+    """Create a ProgressivePinnedMemoryAllocator with fast expansion for tests."""
+    return ProgressivePinnedMemoryAllocator(
+        size=size,
+        initial_ratio=0.3,
+        expand_trigger_ratio=0.5,
+        step_ratio=0.2,
+    )
+
+
+ALLOCATOR_FACTORIES = [
+    pytest.param(_create_pin_allocator, id="pin"),
+    pytest.param(_create_progressive_allocator, id="progressive"),
+]
+
+
 @pytest.mark.parametrize("lmserver_v1_process", ["cpu"], indirect=True)
 @pytest.mark.parametrize(
     "url",
@@ -32,16 +68,18 @@ from .utils import (
         "lm://localhost:65000",
     ],
 )
-def test_lm_connector(url, autorelease_v1, lmserver_v1_process):
+@pytest.mark.parametrize("allocator_factory", ALLOCATOR_FACTORIES)
+def test_lm_connector(url, autorelease_v1, lmserver_v1_process, allocator_factory):
     if url.startswith("lm"):
         url = lmserver_v1_process.server_url
 
     async_loop, async_thread = init_asyncio_loop()
-    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    memory_allocator = allocator_factory(1024 * 1024 * 1024)
     local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
     connector = autorelease_v1(CreateConnector(url, async_loop, local_cpu_backend))
 
-    random_key = dumb_cache_engine_key()
+    random_key = _unique_cache_key()
+    # random_key = dumb_cache_engine_key()
     future = asyncio.run_coroutine_threadsafe(connector.exists(random_key), async_loop)
     assert not future.result()
 
@@ -79,7 +117,10 @@ def test_lm_connector(url, autorelease_v1, lmserver_v1_process):
 @pytest.mark.parametrize("full_chunk", [True, False])
 @pytest.mark.parametrize("save_chunk_meta", [True, False])
 @pytest.mark.parametrize("use_mla", [True, False])
-def test_fs_connector(autorelease_v1, full_chunk, save_chunk_meta, use_mla):
+@pytest.mark.parametrize("allocator_factory", ALLOCATOR_FACTORIES)
+def test_fs_connector(
+    autorelease_v1, full_chunk, save_chunk_meta, use_mla, allocator_factory
+):
     """
     Test FSConnector: exists, put, get, list, and file store
     with the following conditions:
@@ -92,7 +133,7 @@ def test_fs_connector(autorelease_v1, full_chunk, save_chunk_meta, use_mla):
         # Setup
         url = f"fs://host:0/{temp_dir}/"
         async_loop, async_thread = init_asyncio_loop()
-        memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+        memory_allocator = allocator_factory(1024 * 1024 * 1024)
         # full chunk's kv_shape (num_layer, 2, chunk_size, num_kv_head, head_size)
         kv_shape = (32, 1 if use_mla else 2, 256, 1 if use_mla else 8, 128)
         dtype = torch.bfloat16
@@ -179,7 +220,8 @@ def test_fs_connector(autorelease_v1, full_chunk, save_chunk_meta, use_mla):
         "unix:///tmp/redis.sock",
     ],
 )
-def test_redis_connector(url, autorelease_v1):
+@pytest.mark.parametrize("allocator_factory", ALLOCATOR_FACTORIES)
+def test_redis_connector(url, autorelease_v1, allocator_factory):
     """Test Redis connector: exists, put, get operations.
 
     This test uses the MockRedis from conftest.py to simulate
@@ -187,7 +229,7 @@ def test_redis_connector(url, autorelease_v1):
     """
 
     async_loop, async_thread = init_asyncio_loop()
-    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    memory_allocator = allocator_factory(1024 * 1024 * 1024)
     local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
     connector = autorelease_v1(CreateConnector(url, async_loop, local_cpu_backend))
 
@@ -240,7 +282,8 @@ def test_redis_connector(url, autorelease_v1):
         "redis-sentinel://localhost:26379",
     ],
 )
-def test_redis_sentinel_connector(url, autorelease_v1):
+@pytest.mark.parametrize("allocator_factory", ALLOCATOR_FACTORIES)
+def test_redis_sentinel_connector(url, autorelease_v1, allocator_factory):
     """Test Redis Sentinel connector: exists, put, get operations.
 
     This test uses the MockRedisSentinel from conftest.py to simulate
@@ -254,7 +297,7 @@ def test_redis_sentinel_connector(url, autorelease_v1):
     os.environ["REDIS_TIMEOUT"] = "5"
 
     async_loop, async_thread = init_asyncio_loop()
-    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    memory_allocator = allocator_factory(1024 * 1024 * 1024)
     local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
     connector = autorelease_v1(CreateConnector(url, async_loop, local_cpu_backend))
 
@@ -302,7 +345,8 @@ REDIS_CLUSTER_URLS = [
 
 
 @pytest.mark.parametrize("url", REDIS_CLUSTER_URLS)
-def test_redis_cluster_connector(url, autorelease_v1):
+@pytest.mark.parametrize("allocator_factory", ALLOCATOR_FACTORIES)
+def test_redis_cluster_connector(url, autorelease_v1, allocator_factory):
     """Test Redis Cluster connector: exists, put, get operations.
 
     This test uses the MockRedisCluster from conftest.py to simulate
@@ -315,7 +359,7 @@ def test_redis_cluster_connector(url, autorelease_v1):
     os.environ["REDIS_TIMEOUT"] = "3.5"
 
     async_loop, async_thread = init_asyncio_loop()
-    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    memory_allocator = allocator_factory(1024 * 1024 * 1024)
     local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
     connector = autorelease_v1(CreateConnector(url, async_loop, local_cpu_backend))
 
@@ -359,9 +403,10 @@ def test_redis_cluster_connector(url, autorelease_v1):
 
 
 @pytest.mark.parametrize("url", REDIS_CLUSTER_URLS)
-def test_cluster_metadata_without_kv_bytes(url, autorelease_v1):
+@pytest.mark.parametrize("allocator_factory", ALLOCATOR_FACTORIES)
+def test_cluster_metadata_without_kv_bytes(url, autorelease_v1, allocator_factory):
     async_loop, async_thread = init_asyncio_loop()
-    memory_allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+    memory_allocator = allocator_factory(1024 * 1024 * 1024)
     local_cpu_backend = _create_local_cpu_backend(memory_allocator, False)
     connector = autorelease_v1(CreateConnector(url, async_loop, local_cpu_backend))
 
